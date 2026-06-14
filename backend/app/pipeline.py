@@ -1,5 +1,6 @@
 import shutil
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 
 from app.ingestion.parser import PDFParser
 from app.ingestion.image_processor import ImageProcessor
@@ -14,27 +15,37 @@ from app.utils.logger import get_logger
 logger = get_logger("pipeline")
 
 
-def run_ingestion(file_path: str, paper_id: str, minio_store: MinioStore) -> None:
+def run_ingestion(file_path: str, paper_id: str, minio_store: MinioStore, original_filename: str = "") -> None:
     parser = PDFParser()
-    result = parser.parse(file_path)
+    result = parser.parse(file_path, original_filename=original_filename)
     logger.info(f"Parsed {file_path}")
 
     image_processor = ImageProcessor()
-    image_chunks = image_processor.process(
-        paper_id=result["paper_id"],
-        doc=result["document"],
-        images_dir=result["images_dir"],
-        minio_store=minio_store,
-    )
-    logger.info(f"{len(image_chunks)} image chunks created")
-
     table_processor = TableProcessor()
-    table_chunks = table_processor.process(result["paper_id"], result["document"])
-    logger.info(f"{len(table_chunks)} table chunks created")
-
     text_chunker = TextChunker()
-    text_chunks = text_chunker.process(result["paper_id"], result["document"])
-    logger.info(f"{len(text_chunks)} text chunks created")
+
+    # Image descriptions, table summaries, and text chunking are fully independent
+    # — run all three concurrently to eliminate sequential Groq API wait time
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        image_future = executor.submit(
+            image_processor.process,
+            result["paper_id"], result["document"], result["images_dir"], minio_store
+        )
+        table_future = executor.submit(
+            table_processor.process,
+            result["paper_id"], result["document"]
+        )
+        text_future = executor.submit(
+            text_chunker.process,
+            result["paper_id"], result["document"]
+        )
+        wait([image_future, table_future, text_future], return_when=ALL_COMPLETED)
+
+    image_chunks = image_future.result()
+    table_chunks = table_future.result()
+    text_chunks  = text_future.result()
+
+    logger.info(f"{len(image_chunks)} image | {len(table_chunks)} table | {len(text_chunks)} text chunks")
 
     manager = ChunkManager()
     all_chunks = manager.combine(text_chunks, image_chunks, table_chunks)
@@ -47,6 +58,11 @@ def run_ingestion(file_path: str, paper_id: str, minio_store: MinioStore) -> Non
     vector_store.upsert(all_embeddings)
     logger.info("Embeddings stored in Qdrant")
 
+    minio_store.upload_file(
+        f"{paper_id}/document_metadata.json",
+        str(result["metadata_path"]),
+        content_type="application/json",
+    )
     minio_store.upload_file(
         f"{paper_id}/markdown/document.md",
         str(result["markdown_path"]),

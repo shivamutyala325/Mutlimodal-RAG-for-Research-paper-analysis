@@ -1,0 +1,28 @@
+# Web framework
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+python-multipart==0.0.32
+python-dotenv==1.2.2
+pydantic==2.13.4
+pydantic-settings==2.14.1
+
+# Document parsing
+docling==2.96.1
+
+# Storage
+minio==7.2.20
+qdrant-client==1.18.0
+
+# LangChain / LangGraph
+langchain-core==1.4.0
+langchain-groq==1.1.2
+langgraph==1.2.4
+langgraph-prebuilt==1.1.0
+
+# External model clients
+groq==0.37.1
+fastembed==0.4.2
+
+# ML — CPU-only build (no CUDA/nvidia/triton bloat)
+torch==2.12.0+cpu
+torchvision==0.27.0+cpu

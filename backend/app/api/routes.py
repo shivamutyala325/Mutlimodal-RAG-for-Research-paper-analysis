@@ -3,9 +3,15 @@ from pathlib import Path
 from typing import Dict
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from langchain_core.messages import HumanMessage, AIMessage
 
 from app.api.models import (
     ChunkResult,
+    ContextChunk,
+    ChatRequest,
+    ChatResponse,
+    ChatHistoryResponse,
+    MessageRecord,
     ImageUrlResponse,
     IngestResponse,
     PaperInfo,
@@ -18,7 +24,11 @@ from app.ingestion.parser import compute_paper_id
 from app.pipeline import run_ingestion
 from app.storage.minio_store import MinioStore
 from app.storage.retriver import Retriever
+from app.generation.graph import Chatbot
 from app.utils.logger import get_logger
+
+# One shared graph instance for all sessions — MemorySaver holds state per thread_id
+_chatgraph = Chatbot().get_chatgraph()
 
 logger = get_logger("routes")
 router = APIRouter()
@@ -28,12 +38,12 @@ router = APIRouter()
 _jobs: Dict[str, dict] = {}
 
 
-def _pipeline_task(file_path: str, paper_id: str) -> None:
+def _pipeline_task(file_path: str, paper_id: str, original_filename: str) -> None:
     """Runs in a background thread via FastAPI BackgroundTasks."""
     _jobs[paper_id] = {"status": "processing", "message": "Pipeline is running"}
     try:
         minio_store = MinioStore()
-        run_ingestion(file_path, paper_id, minio_store)
+        run_ingestion(file_path, paper_id, minio_store, original_filename=original_filename)
         _jobs[paper_id] = {"status": "completed", "message": "Ingestion complete"}
         logger.info(f"Pipeline completed for {paper_id}")
     except Exception as e:
@@ -86,7 +96,7 @@ async def ingest(background_tasks: BackgroundTasks, file: UploadFile = File(...)
         )
 
     _jobs[paper_id] = {"status": "queued", "message": "Queued for ingestion"}
-    background_tasks.add_task(_pipeline_task, tmp_path, paper_id)
+    background_tasks.add_task(_pipeline_task, tmp_path, paper_id, file.filename)
 
     return IngestResponse(
         paper_id=paper_id,
@@ -165,14 +175,15 @@ def list_papers():
     minio_store = MinioStore()
     paper_ids = minio_store.list_papers()
 
-    papers = [
-        PaperInfo(
+    papers = []
+    for pid in paper_ids:
+        meta = minio_store.get_json(f"{pid}/document_metadata.json")
+        papers.append(PaperInfo(
             paper_id=pid,
+            filename=meta.get("original_filename"),
             has_original=minio_store.object_exists(f"{pid}/original.pdf"),
             has_markdown=minio_store.object_exists(f"{pid}/markdown/document.md"),
-        )
-        for pid in paper_ids
-    ]
+        ))
 
     return PapersResponse(papers=papers, total=len(papers))
 
@@ -198,3 +209,99 @@ def get_image_url(paper_id: str, filename: str):
         url=url,
         expires_in_seconds=3600,
     )
+
+
+# ── POST /chat/{session_id} ───────────────────────────────────────────────────
+
+@router.post(
+    "/chat/{session_id}",
+    response_model=ChatResponse,
+    summary="Send a message and get a response from the knowledge base",
+)
+def chat(session_id: str, request: ChatRequest):
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message must not be empty")
+
+    config = {"configurable": {"thread_id": session_id}}
+
+    result = _chatgraph.invoke(
+        {
+            "messages": [HumanMessage(content=request.message)],
+            "paper_id": request.paper_id,
+        },
+        config=config,
+    )
+
+    ai_response = result["messages"][-1].content
+    retrieved   = result.get("retrieve", False)
+    raw_context = result.get("context", [])
+
+    context = [
+        ContextChunk(
+            chunk_type=c.get("chunk_type", "text"),
+            content=c.get("content", ""),
+            metadata=c.get("metadata", {}),
+            paper_id=c.get("paper_id", ""),
+        )
+        for c in raw_context
+    ]
+
+    return ChatResponse(
+        session_id=session_id,
+        response=ai_response,
+        retrieved=retrieved,
+        context=context,
+    )
+
+
+# ── GET /chat/{session_id}/history ────────────────────────────────────────────
+
+@router.get(
+    "/chat/{session_id}/history",
+    response_model=ChatHistoryResponse,
+    summary="Get the full conversation history for a session",
+)
+def get_chat_history(session_id: str):
+    config = {"configurable": {"thread_id": session_id}}
+    state  = _chatgraph.get_state(config)
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail=f"No session found for id: {session_id}")
+
+    raw_messages = state.values.get("messages", [])
+
+    messages = []
+    for msg in raw_messages:
+        if isinstance(msg, HumanMessage):
+            messages.append(MessageRecord(role="human", content=msg.content))
+        elif isinstance(msg, AIMessage):
+            messages.append(MessageRecord(role="ai", content=msg.content))
+
+    # Count turns: one turn = one human + one AI exchange
+    turns = sum(1 for m in messages if m.role == "human")
+
+    return ChatHistoryResponse(
+        session_id=session_id,
+        messages=messages,
+        total_turns=turns,
+    )
+
+
+# ── DELETE /chat/{session_id} ─────────────────────────────────────────────────
+
+@router.delete(
+    "/chat/{session_id}",
+    summary="Clear the conversation history for a session",
+)
+def clear_session(session_id: str):
+    storage = _chatgraph.checkpointer.storage
+    keys_to_delete = [k for k in storage if session_id in str(k)]
+
+    if not keys_to_delete:
+        raise HTTPException(status_code=404, detail=f"No session found for id: {session_id}")
+
+    for k in keys_to_delete:
+        del storage[k]
+
+    logger.info(f"Cleared session {session_id}")
+    return {"session_id": session_id, "status": "cleared"}

@@ -9,7 +9,6 @@ services:
 
   minio:
     image: minio/minio:latest
-    container_name: minio_container
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -21,6 +20,33 @@ services:
     command: server /data --console-address ":9001"
     restart: unless-stopped
 
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      # Override localhost defaults with Docker service names
+      MINIO_ENDPOINT: minio:9000
+      QDRANT_HOST: qdrant
+    volumes:
+      - model_cache:/root/.cache
+    depends_on:
+      - qdrant
+      - minio
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://backend:8000/api/v1
+    depends_on:
+      - backend
+    restart: unless-stopped
+
 volumes:
   qdrant_data:
   minio_data:
+  model_cache:

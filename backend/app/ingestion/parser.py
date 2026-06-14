@@ -35,7 +35,7 @@ class PDFParser:
             }
         )
 
-    def parse(self, pdf_path: str, storage_root: str = "storage"):
+    def parse(self, pdf_path: str, original_filename: str = "", storage_root: str = "storage"):
 
         paper_id = compute_paper_id(pdf_path)
         paper_dir = (Path(storage_root)/ "papers"/ paper_id)
@@ -67,7 +67,7 @@ class PDFParser:
 
         metadata = {
             "paper_id": paper_id,
-            "source_file": pdf_path,
+            "original_filename": original_filename,
             "num_tables": len(doc.tables),
             "num_images": len(doc.pictures),
             "num_text_items": len(doc.texts)

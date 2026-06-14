@@ -1,4 +1,4 @@
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 from app.storage.retriver import Retriever
 from pydantic import BaseModel
@@ -9,7 +9,7 @@ class RouteDecision(BaseModel):
 
 
 def route_node(state):
-    model = ChatOllama(model=state.chat_model)
+    model = ChatGroq(model=state.chat_model)
     query = state.messages[-1].content
 
     system = SystemMessage(content=(
@@ -19,9 +19,7 @@ def route_node(state):
         "Return retrieve=False if the query is a greeting, small talk, or can be answered from conversation history alone."
     ))
 
-    model_with_structured_output = model.with_structured_output(RouteDecision)
-
-    result = model_with_structured_output.invoke([
+    result = model.with_structured_output(RouteDecision).invoke([
         system,
         HumanMessage(content=f"Conversation history: {state.messages[:-1]}\nQuery: {query}")
     ])
@@ -32,12 +30,12 @@ def route_node(state):
 def retrive_node(state):
     query = state.messages[-1].content
     retriever = Retriever()
-    results = retriever.retrieve(query)
+    results = retriever.retrieve(query, paper_id=state.paper_id)
     return {"context": [r["chunk"] for r in results]}
 
 
 def chat_node(state):
-    model = ChatOllama(model=state.chat_model)
+    model = ChatGroq(model=state.chat_model)
     query = state.messages[-1].content
 
     system = SystemMessage(content=(
@@ -59,11 +57,9 @@ def chat_node(state):
                 context_parts.append(f"[Chunk {i+1}] (Table)\n{content}")
             else:
                 context_parts.append(f"[Chunk {i+1}] (Text)\n{content}")
-        context_text = "\n\n".join(context_parts)
-        current = HumanMessage(content=f"Context:\n{context_text}\n\nQuestion: {query}")
+        current = HumanMessage(content=f"Context:\n\n{''.join(context_parts)}\n\nQuestion: {query}")
     else:
         current = HumanMessage(content=query)
 
     response = model.invoke([system] + history + [current])
-
     return {"messages": [response]}
